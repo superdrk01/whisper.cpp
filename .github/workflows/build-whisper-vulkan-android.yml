@@ -132,6 +132,31 @@ jobs:
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
           echo "ANDROID_CMAKE=${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin/cmake" >> "$GITHUB_ENV"
 
+      - name: Install SPIRV-Headers CMake package
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SPIRV_PREFIX="$GITHUB_WORKSPACE/deps/spirv-headers"
+          rm -rf "$GITHUB_WORKSPACE/build/spirv-headers-host" "$SPIRV_PREFIX"
+
+          "$ANDROID_CMAKE" \
+            -S "$GITHUB_WORKSPACE/SPIRV-Headers" \
+            -B "$GITHUB_WORKSPACE/build/spirv-headers-host" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$SPIRV_PREFIX" \
+            -DSPIRV_HEADERS_ENABLE_INSTALL=ON \
+            -DSPIRV_HEADERS_ENABLE_TESTS=OFF
+
+          "$ANDROID_CMAKE" \
+            --build "$GITHUB_WORKSPACE/build/spirv-headers-host" \
+            --target install \
+            --parallel "$(nproc)"
+
+          test -f "$SPIRV_PREFIX/share/cmake/SPIRV-Headers/SPIRV-HeadersConfig.cmake"
+          echo "SPIRV_HEADERS_PREFIX=$SPIRV_PREFIX" >> "$GITHUB_ENV"
+
       - name: Configure Android build
         shell: bash
         run: |
@@ -153,7 +178,9 @@ jobs:
             -DWHISPER_CPP_DIR="$GITHUB_WORKSPACE/whisper.cpp" \
             -DVULKAN_HEADERS_DIR="$GITHUB_WORKSPACE/Vulkan-Headers/include" \
             -DVulkan_INCLUDE_DIR="$GITHUB_WORKSPACE/Vulkan-Headers/include" \
-            -DSPIRV_HEADERS_DIR="$GITHUB_WORKSPACE/SPIRV-Headers/include" \
+            -DSPIRV_HEADERS_DIR="$SPIRV_HEADERS_PREFIX/include" \
+            -DSPIRV-Headers_DIR="$SPIRV_HEADERS_PREFIX/share/cmake/SPIRV-Headers" \
+            -DCMAKE_PREFIX_PATH="$SPIRV_HEADERS_PREFIX" \
             -DGGML_VULKAN=ON \
             -DGGML_CPU=ON \
             -DGGML_NATIVE=OFF \
