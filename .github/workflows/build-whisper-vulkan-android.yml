@@ -26,6 +26,7 @@ env:
   NDK_VERSION: "28.1.13356709"
   CMAKE_VERSION: "3.31.1"
   VULKAN_HEADERS_REF: "v1.3.296"
+  SPIRV_HEADERS_REF: "vulkan-sdk-1.3.296.0"
   WHISPER_REF: ${{ github.event.inputs.whisper_ref || 'v1.9.1' }}
   ANDROID_API: ${{ github.event.inputs.android_api || '26' }}
 
@@ -61,12 +62,22 @@ jobs:
           path: Vulkan-Headers
           fetch-depth: 1
 
-      - name: Validate Vulkan headers
+      - name: Checkout SPIRV-Headers
+        uses: actions/checkout@v4
+        with:
+          repository: KhronosGroup/SPIRV-Headers
+          ref: ${{ env.SPIRV_HEADERS_REF }}
+          path: SPIRV-Headers
+          fetch-depth: 1
+
+      - name: Validate Vulkan and SPIR-V headers
         shell: bash
         run: |
           set -euxo pipefail
           test -f "$GITHUB_WORKSPACE/Vulkan-Headers/include/vulkan/vulkan.h"
           test -f "$GITHUB_WORKSPACE/Vulkan-Headers/include/vulkan/vulkan.hpp"
+          test -f "$GITHUB_WORKSPACE/SPIRV-Headers/include/spirv/unified1/spirv.h"
+          test -f "$GITHUB_WORKSPACE/SPIRV-Headers/include/spirv/unified1/spirv.hpp"
 
       - name: Install host shader toolchain
         shell: bash
@@ -119,9 +130,9 @@ jobs:
             -DWHISPER_CPP_DIR="$GITHUB_WORKSPACE/whisper.cpp" \
             -DVULKAN_HEADERS_DIR="$GITHUB_WORKSPACE/Vulkan-Headers/include" \
             -DVulkan_INCLUDE_DIR="$GITHUB_WORKSPACE/Vulkan-Headers/include" \
+            -DSPIRV_HEADERS_DIR="$GITHUB_WORKSPACE/SPIRV-Headers/include" \
             -DGGML_VULKAN=ON \
             -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" \
-            -DSPIRV-Headers_DIR=/usr/share/cmake/SPIRV-Headers \
             -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
             -DGGML_NATIVE=OFF \
             -DGGML_OPENMP=OFF \
@@ -188,6 +199,7 @@ jobs:
           cmake_version=${CMAKE_VERSION}
           glslc=$(glslc --version | head -n 1)
           vulkan_headers_ref=${VULKAN_HEADERS_REF}
+          spirv_headers_ref=${SPIRV_HEADERS_REF}
           EOF
 
           (cd dist && zip -qr "whisper-vulkan-android-${ABI}.zip" "$ABI")
