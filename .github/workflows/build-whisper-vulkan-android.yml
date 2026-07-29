@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       whisper_ref:
-        description: whisper.cpp git ref (tag, branch, or SHA)
+        description: "whisper.cpp git ref (branch, tag, or commit SHA)"
         required: true
-        default: v1.9.1
+        default: "master"
       android_api:
-        description: Minimum Android API level
+        description: "Minimum Android API level"
         required: true
         default: "26"
   push:
@@ -16,8 +16,6 @@ on:
       - ".github/workflows/build-whisper-vulkan-android.yml"
       - "android/**"
       - "scripts/**"
-      - "docs/**"
-      - "examples/**"
 
 permissions:
   contents: read
@@ -27,19 +25,20 @@ env:
   CMAKE_VERSION: "3.31.1"
   VULKAN_HEADERS_REF: "v1.3.296"
   SPIRV_HEADERS_REF: "vulkan-sdk-1.3.296.0"
-  WHISPER_REF: ${{ github.event.inputs.whisper_ref || 'v1.9.1' }}
+  WHISPER_REF: ${{ github.event.inputs.whisper_ref || 'master' }}
   ANDROID_API: ${{ github.event.inputs.android_api || '26' }}
 
 jobs:
   build:
-    name: ${{ matrix.abi }}
+    name: Build ${{ matrix.abi }}
     runs-on: ubuntu-24.04
+
     strategy:
       fail-fast: false
       matrix:
+        # Vulkan is intentionally limited to 64-bit Android targets.
         abi:
           - arm64-v8a
-          - armeabi-v7a
           - x86_64
 
     steps:
@@ -70,14 +69,33 @@ jobs:
           path: SPIRV-Headers
           fetch-depth: 1
 
-      - name: Validate Vulkan and SPIR-V headers
+      - name: Validate checked-out APIs and headers
         shell: bash
         run: |
           set -euxo pipefail
+
           test -f "$GITHUB_WORKSPACE/Vulkan-Headers/include/vulkan/vulkan.h"
           test -f "$GITHUB_WORKSPACE/Vulkan-Headers/include/vulkan/vulkan.hpp"
           test -f "$GITHUB_WORKSPACE/SPIRV-Headers/include/spirv/unified1/spirv.h"
           test -f "$GITHUB_WORKSPACE/SPIRV-Headers/include/spirv/unified1/spirv.hpp"
+
+          # The JNI wrapper requires these newer whisper.cpp APIs.
+          grep -q "whisper_full_get_token_t0" \
+            "$GITHUB_WORKSPACE/whisper.cpp/include/whisper.h"
+          grep -q "whisper_full_get_token_t1" \
+            "$GITHUB_WORKSPACE/whisper.cpp/include/whisper.h"
+          grep -q "whisper_full_n_vad_segments" \
+            "$GITHUB_WORKSPACE/whisper.cpp/include/whisper.h"
+          grep -q "whisper_full_get_vad_segment_t0" \
+            "$GITHUB_WORKSPACE/whisper.cpp/include/whisper.h"
+          grep -q "whisper_full_get_vad_segment_t1" \
+            "$GITHUB_WORKSPACE/whisper.cpp/include/whisper.h"
+
+          # Catch the common CMake typo that produces an android/BEFORE include path.
+          if grep -R -nE 'include_directories\([[:space:]]*SYSTEM[[:space:]]+BEFORE' android; then
+            echo "ERROR: use include_directories(BEFORE SYSTEM ...), not SYSTEM BEFORE." >&2
+            exit 1
+          fi
 
       - name: Install host shader toolchain
         shell: bash
@@ -88,8 +106,9 @@ jobs:
             build-essential \
             glslc \
             ninja-build \
-            spirv-headers \
-            libvulkan-dev
+            libvulkan-dev \
+            zip \
+            unzip
           glslc --version
 
       - name: Set up Java
@@ -109,6 +128,7 @@ jobs:
           sdkmanager \
             "ndk;${NDK_VERSION}" \
             "cmake;${CMAKE_VERSION}"
+
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
           echo "ANDROID_CMAKE=${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin/cmake" >> "$GITHUB_ENV"
 
@@ -116,6 +136,9 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+
+          rm -rf "build/${{ matrix.abi }}"
+
           "$ANDROID_CMAKE" \
             -S android \
             -B "build/${{ matrix.abi }}" \
@@ -132,77 +155,85 @@ jobs:
             -DVulkan_INCLUDE_DIR="$GITHUB_WORKSPACE/Vulkan-Headers/include" \
             -DSPIRV_HEADERS_DIR="$GITHUB_WORKSPACE/SPIRV-Headers/include" \
             -DGGML_VULKAN=ON \
-            -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" \
-            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+            -DGGML_CPU=ON \
             -DGGML_NATIVE=OFF \
             -DGGML_OPENMP=OFF \
             -DGGML_CCACHE=OFF \
             -DGGML_BUILD_TESTS=OFF \
             -DWHISPER_BUILD_TESTS=OFF \
-            -DWHISPER_BUILD_EXAMPLES=OFF
+            -DWHISPER_BUILD_EXAMPLES=OFF \
+            -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH
 
-      - name: Build library and compile Vulkan shaders
+      - name: Build library and Vulkan shaders
         shell: bash
         run: |
           set -euxo pipefail
-          "$ANDROID_CMAKE" --build "build/${{ matrix.abi }}" --target whisper_android -j "$(nproc)"
+          "$ANDROID_CMAKE" \
+            --build "build/${{ matrix.abi }}" \
+            --target whisper_android \
+            --parallel "$(nproc)"
 
       - name: Stage ABI package
         shell: bash
         run: |
           set -euxo pipefail
+
           ABI="${{ matrix.abi }}"
           STAGE="dist/$ABI"
-          mkdir -p "$STAGE/lib" "$STAGE/include" "$STAGE/generated-shaders"
+          mkdir -p "$STAGE/lib" "$STAGE/include" "$STAGE/java/com/example/whisper"
 
-          LIB=$(find "build/$ABI" -type f -name 'libwhisper_android.so' -print -quit)
+          LIB="$(find "build/$ABI" -type f -name 'libwhisper_android.so' -print -quit)"
           test -n "$LIB"
           cp "$LIB" "$STAGE/lib/"
 
-          # c++_shared is required because ANDROID_STL=c++_shared.
           case "$ABI" in
-            arm64-v8a) TRIPLE=aarch64-linux-android ;;
-            armeabi-v7a) TRIPLE=arm-linux-androideabi ;;
-            x86_64) TRIPLE=x86_64-linux-android ;;
+            arm64-v8a) TRIPLE="aarch64-linux-android" ;;
+            x86_64)    TRIPLE="x86_64-linux-android" ;;
             *) echo "Unsupported ABI: $ABI" >&2; exit 2 ;;
           esac
-          PREBUILT=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d -print -quit)
+
+          PREBUILT="$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" \
+            -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          test -n "$PREBUILT"
+
           CXX_SHARED="$PREBUILT/sysroot/usr/lib/$TRIPLE/libc++_shared.so"
           test -f "$CXX_SHARED"
           cp "$CXX_SHARED" "$STAGE/lib/"
 
-          # Fail CI unless every shipped DSO has ELF LOAD alignment >= 16 KB.
-          PREBUILT_BIN="$PREBUILT/bin"
-          READELF="$PREBUILT_BIN/llvm-readelf" scripts/verify-16kb-elf.sh \
+          # Verify that every shipped shared library supports 16 KB ELF pages.
+          READELF="$PREBUILT/bin/llvm-readelf" \
+            scripts/verify-16kb-elf.sh \
             "$STAGE/lib/libwhisper_android.so" \
             "$STAGE/lib/libc++_shared.so"
 
           cp android/include/whisper_android.h "$STAGE/include/"
-          mkdir -p "$STAGE/java/com/example/whisper"
-          cp android/java/com/example/whisper/WhisperEngine.java "$STAGE/java/com/example/whisper/"
-          cp android/consumer-rules.pro "$STAGE/"
           cp whisper.cpp/include/whisper.h "$STAGE/include/"
           cp whisper.cpp/ggml/include/ggml.h "$STAGE/include/"
-
-          find "build/$ABI" -type f \( \
-              -name 'ggml-vulkan-shaders.hpp' -o \
-              -name '*.comp.cpp' -o \
-              -name '*.spv' \
-            \) -exec cp --parents {} "$STAGE/generated-shaders/" \;
+          cp android/java/com/example/whisper/WhisperEngine.java \
+            "$STAGE/java/com/example/whisper/"
+          cp android/consumer-rules.pro "$STAGE/"
 
           cat > "$STAGE/build-info.txt" <<EOF
           whisper_ref=${WHISPER_REF}
+          whisper_commit=$(git -C whisper.cpp rev-parse HEAD)
           android_abi=${ABI}
           android_api=${ANDROID_API}
           ndk_version=${NDK_VERSION}
-          page_size_compatible=16384
           cmake_version=${CMAKE_VERSION}
-          glslc=$(glslc --version | head -n 1)
+          build_type=Release
+          vulkan=enabled
+          cpu_fallback=enabled
+          page_size_compatible=16384
           vulkan_headers_ref=${VULKAN_HEADERS_REF}
           spirv_headers_ref=${SPIRV_HEADERS_REF}
           EOF
 
-          (cd dist && zip -qr "whisper-vulkan-android-${ABI}.zip" "$ABI")
+          mkdir -p dist
+          (
+            cd dist
+            zip -qr "whisper-vulkan-android-${ABI}.zip" "$ABI"
+          )
 
       - name: Upload ABI artifact
         uses: actions/upload-artifact@v4
@@ -213,9 +244,10 @@ jobs:
           retention-days: 14
 
   bundle:
-    name: Combined package
+    name: Create combined package
     runs-on: ubuntu-24.04
     needs: build
+
     steps:
       - name: Download ABI artifacts
         uses: actions/download-artifact@v4
@@ -228,11 +260,14 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir combined
+          mkdir -p combined
           for zipfile in artifacts/*.zip; do
             unzip -q "$zipfile" -d combined
           done
-          (cd combined && zip -qr ../whisper-vulkan-android-all-abis.zip .)
+          (
+            cd combined
+            zip -qr ../whisper-vulkan-android-all-abis.zip .
+          )
 
       - name: Upload combined artifact
         uses: actions/upload-artifact@v4
