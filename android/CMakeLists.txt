@@ -8,6 +8,32 @@ if(NOT DEFINED WHISPER_CPP_DIR)
     message(FATAL_ERROR "Pass -DWHISPER_CPP_DIR=/absolute/path/to/whisper.cpp")
 endif()
 
+if(NOT DEFINED VULKAN_HEADERS_DIR)
+    message(FATAL_ERROR "Pass -DVULKAN_HEADERS_DIR=/absolute/path/to/Vulkan-Headers/include")
+endif()
+if(NOT EXISTS "${VULKAN_HEADERS_DIR}/vulkan/vulkan.h" OR
+   NOT EXISTS "${VULKAN_HEADERS_DIR}/vulkan/vulkan.hpp")
+    message(FATAL_ERROR "VULKAN_HEADERS_DIR must contain vulkan/vulkan.h and vulkan/vulkan.hpp")
+endif()
+
+if(NOT DEFINED SPIRV_HEADERS_DIR)
+    message(FATAL_ERROR "Pass -DSPIRV_HEADERS_DIR=/absolute/path/to/SPIRV-Headers/include")
+endif()
+if(NOT EXISTS "${SPIRV_HEADERS_DIR}/spirv/unified1/spirv.h" OR
+   NOT EXISTS "${SPIRV_HEADERS_DIR}/spirv/unified1/spirv.hpp")
+    message(FATAL_ERROR "SPIRV_HEADERS_DIR must contain spirv/unified1/spirv.h and spirv/unified1/spirv.hpp")
+endif()
+
+# Android's NDK provides the Vulkan loader library and C API headers, but it does
+# not reliably provide Vulkan-Hpp (vulkan.hpp). ggml-vulkan includes that C++
+# header, so make the pinned Khronos Vulkan-Headers tree visible to all targets
+# created by whisper.cpp/ggml.
+include_directories(SYSTEM BEFORE
+    "${VULKAN_HEADERS_DIR}"
+    "${SPIRV_HEADERS_DIR}"
+)
+set(Vulkan_INCLUDE_DIR "${VULKAN_HEADERS_DIR}" CACHE PATH "Vulkan headers" FORCE)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
