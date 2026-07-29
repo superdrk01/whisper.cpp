@@ -28,7 +28,7 @@ endif()
 # not reliably provide Vulkan-Hpp (vulkan.hpp). ggml-vulkan includes that C++
 # header, so make the pinned Khronos Vulkan-Headers tree visible to all targets
 # created by whisper.cpp/ggml.
-include_directories(SYSTEM BEFORE
+include_directories(BEFORE SYSTEM
     "${VULKAN_HEADERS_DIR}"
     "${SPIRV_HEADERS_DIR}"
 )
