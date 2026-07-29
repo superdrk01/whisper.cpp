@@ -230,7 +230,7 @@ jobs:
 
           # Verify that every shipped shared library supports 16 KB ELF pages.
           READELF="$PREBUILT/bin/llvm-readelf" \
-            scripts/verify-16kb-elf.sh \
+            bash scripts/verify-16kb-elf.sh \
             "$STAGE/lib/libwhisper_android.so" \
             "$STAGE/lib/libc++_shared.so"
 
