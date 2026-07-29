@@ -1,0 +1,212 @@
+name: Build whisper.cpp Vulkan for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_ref:
+        description: whisper.cpp git ref (tag, branch, or SHA)
+        required: true
+        default: v1.9.1
+      android_api:
+        description: Minimum Android API level
+        required: true
+        default: "26"
+  push:
+    paths:
+      - ".github/workflows/build-whisper-vulkan-android.yml"
+      - "android/**"
+      - "scripts/**"
+      - "docs/**"
+      - "examples/**"
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: "28.1.13356709"
+  CMAKE_VERSION: "3.31.1"
+  WHISPER_REF: ${{ github.event.inputs.whisper_ref || 'v1.9.1' }}
+  ANDROID_API: ${{ github.event.inputs.android_api || '26' }}
+
+jobs:
+  build:
+    name: ${{ matrix.abi }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+
+    steps:
+      - name: Checkout application repository
+        uses: actions/checkout@v4
+
+      - name: Checkout whisper.cpp
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ env.WHISPER_REF }}
+          path: whisper.cpp
+          fetch-depth: 1
+
+      - name: Install host shader toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            glslc \
+            ninja-build \
+            spirv-headers \
+            libvulkan-dev
+          glslc --version
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK and CMake
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_CMAKE=${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin/cmake" >> "$GITHUB_ENV"
+
+      - name: Configure Android build
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "$ANDROID_CMAKE" \
+            -S android \
+            -B "build/${{ matrix.abi }}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${{ matrix.abi }}" \
+            -DANDROID_PLATFORM="android-${ANDROID_API}" \
+            -DANDROID_STL=c++_shared \
+            -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384" \
+            -DWHISPER_CPP_DIR="$GITHUB_WORKSPACE/whisper.cpp" \
+            -DGGML_VULKAN=ON \
+            -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" \
+            -DSPIRV-Headers_DIR=/usr/share/cmake/SPIRV-Headers \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DGGML_CCACHE=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=OFF
+
+      - name: Build library and compile Vulkan shaders
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "$ANDROID_CMAKE" --build "build/${{ matrix.abi }}" --target whisper_android -j "$(nproc)"
+
+      - name: Stage ABI package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ABI="${{ matrix.abi }}"
+          STAGE="dist/$ABI"
+          mkdir -p "$STAGE/lib" "$STAGE/include" "$STAGE/generated-shaders"
+
+          LIB=$(find "build/$ABI" -type f -name 'libwhisper_android.so' -print -quit)
+          test -n "$LIB"
+          cp "$LIB" "$STAGE/lib/"
+
+          # c++_shared is required because ANDROID_STL=c++_shared.
+          case "$ABI" in
+            arm64-v8a) TRIPLE=aarch64-linux-android ;;
+            armeabi-v7a) TRIPLE=arm-linux-androideabi ;;
+            x86_64) TRIPLE=x86_64-linux-android ;;
+            *) echo "Unsupported ABI: $ABI" >&2; exit 2 ;;
+          esac
+          PREBUILT=$(find "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d -print -quit)
+          CXX_SHARED="$PREBUILT/sysroot/usr/lib/$TRIPLE/libc++_shared.so"
+          test -f "$CXX_SHARED"
+          cp "$CXX_SHARED" "$STAGE/lib/"
+
+          # Fail CI unless every shipped DSO has ELF LOAD alignment >= 16 KB.
+          PREBUILT_BIN="$PREBUILT/bin"
+          READELF="$PREBUILT_BIN/llvm-readelf" scripts/verify-16kb-elf.sh \
+            "$STAGE/lib/libwhisper_android.so" \
+            "$STAGE/lib/libc++_shared.so"
+
+          cp android/include/whisper_android.h "$STAGE/include/"
+          mkdir -p "$STAGE/java/com/example/whisper"
+          cp android/java/com/example/whisper/WhisperEngine.java "$STAGE/java/com/example/whisper/"
+          cp android/consumer-rules.pro "$STAGE/"
+          cp whisper.cpp/include/whisper.h "$STAGE/include/"
+          cp whisper.cpp/ggml/include/ggml.h "$STAGE/include/"
+
+          find "build/$ABI" -type f \( \
+              -name 'ggml-vulkan-shaders.hpp' -o \
+              -name '*.comp.cpp' -o \
+              -name '*.spv' \
+            \) -exec cp --parents {} "$STAGE/generated-shaders/" \;
+
+          cat > "$STAGE/build-info.txt" <<EOF
+          whisper_ref=${WHISPER_REF}
+          android_abi=${ABI}
+          android_api=${ANDROID_API}
+          ndk_version=${NDK_VERSION}
+          page_size_compatible=16384
+          cmake_version=${CMAKE_VERSION}
+          glslc=$(glslc --version | head -n 1)
+          EOF
+
+          (cd dist && zip -qr "whisper-vulkan-android-${ABI}.zip" "$ABI")
+
+      - name: Upload ABI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-android-${{ matrix.abi }}
+          path: dist/whisper-vulkan-android-${{ matrix.abi }}.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle:
+    name: Combined package
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Download ABI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: whisper-vulkan-android-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create combined archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir combined
+          for zipfile in artifacts/*.zip; do
+            unzip -q "$zipfile" -d combined
+          done
+          (cd combined && zip -qr ../whisper-vulkan-android-all-abis.zip .)
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-android-all-abis
+          path: whisper-vulkan-android-all-abis.zip
+          if-no-files-found: error
+          retention-days: 14
